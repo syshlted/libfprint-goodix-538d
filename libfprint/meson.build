@@ -1,7 +1,7 @@
 spi_sources = []
 spi_headers = []
 
-if enabled_spi_drivers.length() > 0
+if have_spi
   spi_headers = ['fpi-spi-transfer.h']
   spi_sources = ['fpi-spi-transfer.c']
 endif
@@ -156,6 +156,7 @@ helper_sources = {
         'sigfm/sigfm.c',
     ),
     'openssl': files(),
+    'pixman': files(),
     'udev': files(),
     'virtual': files('drivers/virtual-device-listener.c'),
 }
@@ -310,8 +311,10 @@ libfprint_private_dep = declare_dependency(
     ]
 )
 
+udev_hwdb_list = 'fprint-list-udev-hwdb.c'
+udev_hwdb_list_file = files(udev_hwdb_list)
 udev_hwdb = executable('fprint-list-udev-hwdb',
-    'fprint-list-udev-hwdb.c',
+    udev_hwdb_list_file,
     dependencies: libfprint_private_dep,
     link_with: libfprint_drivers,
     install: false,
@@ -373,10 +376,13 @@ if install_udev_rules
     )
 endif
 
-sync_udev_udb = custom_target('sync-udev-hwdb',
-    depends: udev_hwdb_generator,
-    output: 'sync-udev-hwdb',
-    install: false,
+udev_hwdb_list_updater = custom_target('udev-hwdb-list-updater',
+    output: udev_hwdb_list,
+    command: [ sync_unsupported_files, udev_hwdb_list_file ],
+)
+
+run_target('sync-udev-hwdb',
+    depends: udev_hwdb_list_updater,
     command: [
         'cp', '-v',
         udev_hwdb_generator.full_path(),
@@ -384,7 +390,7 @@ sync_udev_udb = custom_target('sync-udev-hwdb',
     ]
 )
 
-alias_target('sync-udev-hwdb', sync_udev_udb)
+alias_target('sync-unsupported-devices', udev_hwdb_list_updater)
 
 supported_devices = executable('fprint-list-supported-devices',
     'fprint-list-supported-devices.c',

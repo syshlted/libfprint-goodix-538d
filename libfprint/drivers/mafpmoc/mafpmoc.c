@@ -3,6 +3,7 @@
 #include "glib.h"
 #include "drivers_api.h"
 #include "mafpmoc.h"
+#include "fpi-byte-writer.h"
 
 struct _FpiDeviceMafpmoc
 {
@@ -71,23 +72,6 @@ ma_protocol_crc16_calc ( uint8_t *data, uint32_t data_len, uint32_t start)
   return sum_s;
 }
 
-static void
-init_pack_header (ppack_header pheader, uint16_t frame_len)
-{
-  g_assert (pheader);
-
-  memset (pheader, 0, sizeof (*pheader));
-  pheader->head0 = 0xEF;
-  pheader->head1 = 0x01;
-  pheader->addr0 = 0xFF;
-  pheader->addr1 = 0xFF;
-  pheader->addr2 = 0xFF;
-  pheader->addr3 = 0xFF;
-  pheader->flag = (uint8_t) MAPF_PACK_CMD;
-  pheader->frame_len0 = (frame_len >> 8) & 0xff;
-  pheader->frame_len1 = frame_len & 0xff;
-}
-
 /* data tansfer:
  *      while cmd_len = 0, put flag(end or not) in data[0]
  */
@@ -98,27 +82,48 @@ ma_protocol_build_package (uint32_t       package_len,
                            const uint8_t *data,
                            uint32_t       data_len)
 {
-  g_autofree uint8_t *ppackage = g_new0 (uint8_t, package_len);
-  pack_header header;
+  g_autoptr(FpiByteWriter) writer = NULL;
+  uint8_t flag;
+  uint16_t frame_len;
+  uint16_t crc;
+  gboolean written;
 
-  init_pack_header (&header, package_len - PACKAGE_HEADER_SIZE);
+  writer = fpi_byte_writer_new_with_size (package_len, TRUE);
+
+  written = fpi_byte_writer_put_uint8 (writer, 0xEF);
+  written &= fpi_byte_writer_put_uint8 (writer, 0x01);
+  written &= fpi_byte_writer_put_uint8 (writer, 0xFF);
+  written &= fpi_byte_writer_put_uint8 (writer, 0xFF);
+  written &= fpi_byte_writer_put_uint8 (writer, 0xFF);
+  written &= fpi_byte_writer_put_uint8 (writer, 0xFF);
+
+  flag = (uint8_t) MAPF_PACK_CMD;
+
   if (!cmd_len && data_len)
-    header.flag = data[0];
+    flag = data[0];
 
-  memcpy (ppackage, &header, PACKAGE_HEADER_SIZE);
+  fpi_byte_writer_put_uint8 (writer, flag);
+
+  frame_len = package_len - PACKAGE_HEADER_SIZE;
+
+  written &= fpi_byte_writer_put_uint16_be (writer, frame_len);
 
   if (cmd_len)
-    memcpy (ppackage + PACKAGE_HEADER_SIZE, &cmd, 1);
+    written &= fpi_byte_writer_put_uint8 (writer, cmd);
 
   if (data_len)
-    memcpy (ppackage + PACKAGE_HEADER_SIZE + cmd_len, data + !cmd_len, data_len);
+    written &= fpi_byte_writer_put_data (writer, data + !cmd_len, data_len);
 
-  uint16_t crc = ma_protocol_crc16_calc (ppackage, PACKAGE_HEADER_SIZE + cmd_len + data_len, 6);
+  crc = ma_protocol_crc16_calc ((uint8_t *) writer->parent.data,
+                                PACKAGE_HEADER_SIZE + cmd_len + data_len,
+                                6);
 
-  ppackage[package_len - 2] = (crc >> 8) & 0xFF;
-  ppackage[package_len - 1] = crc & 0xFF;
+  written &= fpi_byte_writer_put_uint16_be (writer, crc);
 
-  return g_steal_pointer (&ppackage);
+  if (!written)
+    g_return_val_if_reached (NULL);
+
+  return fpi_byte_writer_free_and_get_data (g_steal_pointer (&writer));
 }
 
 static int
@@ -427,6 +432,8 @@ alloc_cmd_transfer (FpiDeviceMafpmoc *self,
   g_return_val_if_fail (data || data_len == 0, NULL);
 
   buffer = ma_protocol_build_package (total_len, cmd, cmd_len, data, data_len);
+  g_return_val_if_fail (buffer, NULL);
+
   fpi_usb_transfer_fill_bulk_full (transfer, MAFP_EP_BULK_OUT, buffer, total_len, g_free);
   return g_steal_pointer (&transfer);
 }
@@ -438,9 +445,21 @@ mafp_sensor_cmd (FpiDeviceMafpmoc *self,
                  uint8_t           data_len,
                  SynCmdMsgCallback callback)
 {
-  g_autoptr(FpiUsbTransfer) transfer = alloc_cmd_transfer (self, cmd, 1, data, data_len);
-  CommandData *cmd_data = g_new0 (CommandData, 1);
+  g_autoptr(FpiUsbTransfer) transfer = NULL;
+  CommandData *cmd_data = NULL;
 
+  if (!(transfer = alloc_cmd_transfer (self, cmd, 1, data, data_len)))
+    {
+      g_critical ("Failed to allocate command transfer");
+
+      if (callback)
+        callback (self, NULL, g_error_new (FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                                           "Failed to allocate command transfer"));
+
+      return;
+    }
+
+  cmd_data = g_new0 (CommandData, 1);
   cmd_data->cmd = cmd;
   cmd_data->callback = callback;
   cmd_data->cmd_transfer = g_steal_pointer (&transfer);
@@ -1410,9 +1429,9 @@ fp_enroll_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 
 
 static void
-fp_verify_tpl_table_cb (FpiDeviceMafpmoc    *self,
-                        mafp_cmd_response_t *resp,
-                        GError              *error)
+fp_identify_tpl_table_cb (FpiDeviceMafpmoc    *self,
+                          mafp_cmd_response_t *resp,
+                          GError              *error)
 {
   if (error)
     {
@@ -1429,13 +1448,13 @@ fp_verify_tpl_table_cb (FpiDeviceMafpmoc    *self,
 }
 
 static void
-fp_verify_get_image_cb (FpiDeviceMafpmoc    *self,
-                        mafp_cmd_response_t *resp,
-                        GError              *error)
+fp_identify_get_image_cb (FpiDeviceMafpmoc    *self,
+                          mafp_cmd_response_t *resp,
+                          GError              *error)
 {
   g_autoptr(GError) local_error = NULL;
   FpDevice *dev = FP_DEVICE (self);
-  MapfVerifyState nextState = MAPF_VERIFY_GET_IMAGE;
+  MapfIdentifyState nextState = MAPF_IDENTIFY_GET_IMAGE;
 
   if (error)
     {
@@ -1455,16 +1474,16 @@ fp_verify_get_image_cb (FpiDeviceMafpmoc    *self,
       fp_dbg ("wait finger down state %d", resp->result);
       if (resp->result == MAFP_RE_GET_IMAGE_SUCCESS)
         {
-          nextState = MAPF_VERIFY_GENERATE_FEATURE;
+          nextState = MAPF_IDENTIFY_GENERATE_FEATURE;
         }
       else if (resp->result == MAFP_RE_GET_IMAGE_NONE)
         {
           self->capture_cnt++;
           fp_dbg ("self->capture_cnt %d", self->capture_cnt);
           if (self->capture_cnt > MAFP_IMAGE_ERR_TRRIGER)
-            nextState = MAPF_VERIFY_REFRESH_INT_PARA;
+            nextState = MAPF_IDENTIFY_REFRESH_INT_PARA;
           else
-            nextState = MAPF_VERIFY_DETECT_MODE;
+            nextState = MAPF_IDENTIFY_DETECT_MODE;
         }
     }
   else if (self->press_state == MAFP_PRESS_WAIT_UP)
@@ -1472,13 +1491,13 @@ fp_verify_get_image_cb (FpiDeviceMafpmoc    *self,
       fp_dbg ("wait finger up state %d", resp->result);
       if (resp->result == MAFP_RE_GET_IMAGE_SUCCESS)
         {
-          nextState = MAPF_VERIFY_GET_IMAGE;
+          nextState = MAPF_IDENTIFY_GET_IMAGE;
         }
       else if (resp->result == MAFP_RE_GET_IMAGE_NONE)
         {
           self->press_state = MAFP_PRESS_WAIT_DOWN;
           fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NONE | FP_FINGER_STATUS_NEEDED);
-          nextState = MAPF_VERIFY_CHECK_INT_PARA;
+          nextState = MAPF_IDENTIFY_CHECK_INT_PARA;
         }
     }
 
@@ -1486,9 +1505,9 @@ fp_verify_get_image_cb (FpiDeviceMafpmoc    *self,
 }
 
 static void
-fp_verify_gen_feature_cb (FpiDeviceMafpmoc    *self,
-                          mafp_cmd_response_t *resp,
-                          GError              *error)
+fp_identify_gen_feature_cb (FpiDeviceMafpmoc    *self,
+                            mafp_cmd_response_t *resp,
+                            GError              *error)
 {
   if (error)
     {
@@ -1502,12 +1521,12 @@ fp_verify_gen_feature_cb (FpiDeviceMafpmoc    *self,
     {
       self->enroll_identify_index = 0;
       self->press_state = MAFP_PRESS_WAIT_UP;
-      fpi_ssm_jump_to_state (self->task_ssm, MAPF_VERIFY_SEARCH_STEP);
+      fpi_ssm_jump_to_state (self->task_ssm, MAPF_IDENTIFY_SEARCH_STEP);
     }
   else
     {
       self->press_state = MAFP_PRESS_WAIT_UP;
-      fpi_ssm_jump_to_state (self->task_ssm, MAPF_VERIFY_GET_IMAGE);
+      fpi_ssm_jump_to_state (self->task_ssm, MAPF_IDENTIFY_GET_IMAGE);
     }
 }
 
@@ -1520,13 +1539,13 @@ mafp_scl_ctl_cb (FpiUsbTransfer *transfer,
   if (error)
     fp_dbg ("control transfer out fail, %s", error->message);
 
-  fpi_ssm_jump_to_state (transfer->ssm, MAPF_VERIFY_EXIT);
+  fpi_ssm_jump_to_state (transfer->ssm, MAPF_IDENTIFY_EXIT);
 }
 
 static void
-fp_verify_get_tpl_info_cb (FpiDeviceMafpmoc    *self,
-                           mafp_cmd_response_t *resp,
-                           GError              *error)
+fp_identify_get_tpl_info_cb (FpiDeviceMafpmoc    *self,
+                             mafp_cmd_response_t *resp,
+                             GError              *error)
 {
   g_autoptr(GError) local_error = NULL;
   FpDevice *dev = FP_DEVICE (self);
@@ -1558,27 +1577,18 @@ fp_verify_get_tpl_info_cb (FpiDeviceMafpmoc    *self,
           memcpy (tpl.uid, resp->tpl_info.uid, sizeof (resp->tpl_info.uid));
           new_scan = mafp_print_from_template (self, &tpl);
         }
+
       if (new_scan != NULL)
         {
-          if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY)
-            {
-              fpi_device_get_verify_data (dev, &matching);
-              if (!fp_print_equal (matching, new_scan))
-                matching = NULL;
-            }
-          else
-            {
-              GPtrArray *templates = NULL;
-              fpi_device_get_identify_data (dev, &templates);
-              for (int i = 0; i < templates->len; i++)
-                {
-                  if (fp_print_equal (g_ptr_array_index (templates, i), new_scan))
-                    {
-                      matching = g_ptr_array_index (templates, i);
-                      break;
-                    }
-                }
-            }
+          GPtrArray *templates = NULL;
+          guint matching_index;
+
+          fpi_device_get_identify_data (dev, &templates);
+
+          if (g_ptr_array_find_with_equal_func (templates, new_scan,
+                                                (GEqualFunc) fp_print_equal,
+                                                &matching_index))
+            matching = g_ptr_array_index (templates, matching_index);
         }
     }
 
@@ -1590,13 +1600,13 @@ fp_verify_get_tpl_info_cb (FpiDeviceMafpmoc    *self,
       mafp_sensor_control (self, 0x8C, 0x00, mafp_scl_ctl_cb, NULL, 0);
       return;
     }
-  fpi_ssm_jump_to_state (self->task_ssm, MAPF_VERIFY_EXIT);
+  fpi_ssm_jump_to_state (self->task_ssm, MAPF_IDENTIFY_EXIT);
 }
 
 static void
-fp_verify_search_step_cb (FpiDeviceMafpmoc    *self,
-                          mafp_cmd_response_t *resp,
-                          GError              *error)
+fp_identify_search_step_cb (FpiDeviceMafpmoc    *self,
+                            mafp_cmd_response_t *resp,
+                            GError              *error)
 {
   GPtrArray *prints = NULL;
   FpDevice *dev = FP_DEVICE (self);
@@ -1611,23 +1621,20 @@ fp_verify_search_step_cb (FpiDeviceMafpmoc    *self,
   if (resp->result == MAFP_SUCCESS)
     {
       fp_dbg ("identify ok, search_id: %d", self->search_id);
-      fpi_ssm_jump_to_state (self->task_ssm, MAPF_VERIFY_GET_TEMPLATE_INFO);
+      fpi_ssm_jump_to_state (self->task_ssm, MAPF_IDENTIFY_GET_TEMPLATE_INFO);
     }
   else
     {
       fp_dbg ("identify fail");
-      if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_IDENTIFY)
+      fpi_device_get_identify_data (dev, &prints);
+      self->enroll_identify_index++;
+      if (self->enroll_identify_index < prints->len)
         {
-          fpi_device_get_identify_data (dev, &prints);
-          self->enroll_identify_index++;
-          if (self->enroll_identify_index < prints->len)
-            {
-              fpi_ssm_jump_to_state (self->task_ssm, MAPF_VERIFY_SEARCH_STEP);
-              return;
-            }
+          fpi_ssm_jump_to_state (self->task_ssm, MAPF_IDENTIFY_SEARCH_STEP);
+          return;
         }
       self->search_id = G_MAXUINT16;
-      fpi_ssm_jump_to_state (self->task_ssm, MAPF_VERIFY_GET_TEMPLATE_INFO);
+      fpi_ssm_jump_to_state (self->task_ssm, MAPF_IDENTIFY_GET_TEMPLATE_INFO);
     }
 }
 
@@ -1654,7 +1661,7 @@ mafp_get_startup_result_cb (FpiUsbTransfer *transfer,
         {
           self->search_id = transfer->buffer[2] * 256 + transfer->buffer[1];
           usleep (1000 * 1000);
-          fpi_ssm_jump_to_state (transfer->ssm, MAPF_VERIFY_GET_TEMPLATE_INFO);
+          fpi_ssm_jump_to_state (transfer->ssm, MAPF_IDENTIFY_GET_TEMPLATE_INFO);
           return;
         }
     }
@@ -1662,33 +1669,7 @@ mafp_get_startup_result_cb (FpiUsbTransfer *transfer,
 }
 
 static void
-fp_verify_int_check_cb (FpiDeviceMafpmoc    *self,
-                        mafp_cmd_response_t *resp,
-                        GError              *error)
-{
-  if (error)
-    {
-      fpi_ssm_mark_failed (self->task_ssm, g_steal_pointer (&error));
-      return;
-    }
-  fpi_ssm_next_state (self->task_ssm);
-}
-
-static void
-fp_verify_int_detect_cb (FpiDeviceMafpmoc    *self,
-                         mafp_cmd_response_t *resp,
-                         GError              *error)
-{
-  if (error)
-    {
-      fpi_ssm_mark_failed (self->task_ssm, g_steal_pointer (&error));
-      return;
-    }
-  fpi_ssm_next_state (self->task_ssm);
-}
-
-static void
-fp_verify_int_refresh_cb (FpiDeviceMafpmoc    *self,
+fp_identify_int_check_cb (FpiDeviceMafpmoc    *self,
                           mafp_cmd_response_t *resp,
                           GError              *error)
 {
@@ -1697,15 +1678,41 @@ fp_verify_int_refresh_cb (FpiDeviceMafpmoc    *self,
       fpi_ssm_mark_failed (self->task_ssm, g_steal_pointer (&error));
       return;
     }
-  self->capture_cnt = 0;
-  fpi_ssm_jump_to_state (self->task_ssm, MAPF_VERIFY_GET_IMAGE);
+  fpi_ssm_next_state (self->task_ssm);
 }
 
 static void
-fp_verify_enable_int_cb (FpiUsbTransfer *transfer,
-                         FpDevice       *device,
-                         gpointer        user_data,
-                         GError         *error)
+fp_identify_int_detect_cb (FpiDeviceMafpmoc    *self,
+                           mafp_cmd_response_t *resp,
+                           GError              *error)
+{
+  if (error)
+    {
+      fpi_ssm_mark_failed (self->task_ssm, g_steal_pointer (&error));
+      return;
+    }
+  fpi_ssm_next_state (self->task_ssm);
+}
+
+static void
+fp_identify_int_refresh_cb (FpiDeviceMafpmoc    *self,
+                            mafp_cmd_response_t *resp,
+                            GError              *error)
+{
+  if (error)
+    {
+      fpi_ssm_mark_failed (self->task_ssm, g_steal_pointer (&error));
+      return;
+    }
+  self->capture_cnt = 0;
+  fpi_ssm_jump_to_state (self->task_ssm, MAPF_IDENTIFY_GET_IMAGE);
+}
+
+static void
+fp_identify_enable_int_cb (FpiUsbTransfer *transfer,
+                           FpDevice       *device,
+                           gpointer        user_data,
+                           GError         *error)
 {
   if (error)
     {
@@ -1716,24 +1723,24 @@ fp_verify_enable_int_cb (FpiUsbTransfer *transfer,
 }
 
 static void
-fp_verify_disable_int_cb (FpiUsbTransfer *transfer,
-                          FpDevice       *device,
-                          gpointer        user_data,
-                          GError         *error)
+fp_identify_disable_int_cb (FpiUsbTransfer *transfer,
+                            FpDevice       *device,
+                            gpointer        user_data,
+                            GError         *error)
 {
   if (error)
     {
       fpi_ssm_mark_failed (transfer->ssm, g_steal_pointer (&error));
       return;
     }
-  fpi_ssm_jump_to_state (transfer->ssm, MAPF_VERIFY_GET_IMAGE);
+  fpi_ssm_jump_to_state (transfer->ssm, MAPF_IDENTIFY_GET_IMAGE);
 }
 
 static void
-fp_verify_wait_int_cb (FpiUsbTransfer *transfer,
-                       FpDevice       *device,
-                       gpointer        user_data,
-                       GError         *error)
+fp_identify_wait_int_cb (FpiUsbTransfer *transfer,
+                         FpDevice       *device,
+                         gpointer        user_data,
+                         GError         *error)
 {
   FpiDeviceMafpmoc *self = FPI_DEVICE_MAFPMOC (device);
 
@@ -1742,7 +1749,7 @@ fp_verify_wait_int_cb (FpiUsbTransfer *transfer,
       fp_dbg ("code %d", error->code);
       if (error->code == G_USB_DEVICE_ERROR_TIMED_OUT)
         {
-          fpi_ssm_jump_to_state (self->task_ssm, MAPF_VERIFY_GET_IMAGE);
+          fpi_ssm_jump_to_state (self->task_ssm, MAPF_IDENTIFY_GET_IMAGE);
           g_clear_error (&error);
           return;
         }
@@ -1764,7 +1771,7 @@ fp_verify_wait_int_cb (FpiUsbTransfer *transfer,
 }
 
 static void
-fp_verify_wait_int (FpiDeviceMafpmoc *self)
+fp_identify_wait_int (FpiDeviceMafpmoc *self)
 {
   fp_dbg ("wait interrupt");
   FpiUsbTransfer *transfer = fpi_usb_transfer_new (FP_DEVICE (self));
@@ -1773,12 +1780,12 @@ fp_verify_wait_int (FpiDeviceMafpmoc *self)
   fpi_usb_transfer_submit (transfer,
                            30 * 60 * 1000,
                            fpi_device_get_cancellable (FP_DEVICE (self)),
-                           fp_verify_wait_int_cb,
+                           fp_identify_wait_int_cb,
                            NULL);
 }
 
 static void
-fp_verify_sm_run_state (FpiSsm *ssm, FpDevice *device)
+fp_identify_sm_run_state (FpiSsm *ssm, FpDevice *device)
 {
   FpiDeviceMafpmoc *self = FPI_DEVICE_MAFPMOC (device);
   uint8_t para[PACKAGE_DATA_SIZE_MAX] = { 0 };
@@ -1787,110 +1794,97 @@ fp_verify_sm_run_state (FpiSsm *ssm, FpDevice *device)
 
   switch(fpi_ssm_get_cur_state (ssm))
     {
-    case MAPF_VERIFY_PWR_BTN_SHIELD_ON:
+    case MAPF_IDENTIFY_PWR_BTN_SHIELD_ON:
       mafp_pwr_btn_shield_on (self, 1);
       break;
 
-    case MAPF_VERIFY_TEMPLATE_TABLE:
+    case MAPF_IDENTIFY_TEMPLATE_TABLE:
       para[0] = 0; /* page no. */
-      mafp_sensor_cmd (self, MOC_CMD_GET_TEMPLATE_TABLE, (const uint8_t *) &para, 1, fp_verify_tpl_table_cb);
+      mafp_sensor_cmd (self, MOC_CMD_GET_TEMPLATE_TABLE, (const uint8_t *) &para, 1, fp_identify_tpl_table_cb);
       break;
 
-    case MAPF_VERIFY_GET_STARTUP_RESULT:
+    case MAPF_IDENTIFY_GET_STARTUP_RESULT:
       mafp_sensor_control (self, 0x8D, 0x00, mafp_get_startup_result_cb, NULL, 0);
       break;
 
-    case MAPF_VERIFY_GET_IMAGE:
-      mafp_sensor_cmd (self, MOC_CMD_GET_IMAGE, NULL, 0, fp_verify_get_image_cb);
+    case MAPF_IDENTIFY_GET_IMAGE:
+      mafp_sensor_cmd (self, MOC_CMD_GET_IMAGE, NULL, 0, fp_identify_get_image_cb);
       break;
 
-    case MAPF_VERIFY_CHECK_INT_PARA:
+    case MAPF_IDENTIFY_CHECK_INT_PARA:
       para[0] = MAFP_SLEEP_INT_CHECK;
-      mafp_sensor_cmd (self, MOC_CMD_SLEEP, para, 1, fp_verify_int_check_cb);
+      mafp_sensor_cmd (self, MOC_CMD_SLEEP, para, 1, fp_identify_int_check_cb);
       break;
 
-    case MAPF_VERIFY_DETECT_MODE:
+    case MAPF_IDENTIFY_DETECT_MODE:
       para[0] = MAFP_SLEEP_INT_WAIT;
-      mafp_sensor_cmd (self, MOC_CMD_SLEEP, para, 1, fp_verify_int_detect_cb);
+      mafp_sensor_cmd (self, MOC_CMD_SLEEP, para, 1, fp_identify_int_detect_cb);
       break;
 
-    case MAPF_VERIFY_ENABLE_INT:
-      mafp_sensor_control (self, 0x89, 1, fp_verify_enable_int_cb, NULL, 0);
+    case MAPF_IDENTIFY_ENABLE_INT:
+      mafp_sensor_control (self, 0x89, 1, fp_identify_enable_int_cb, NULL, 0);
       break;
 
-    case MAPF_VERIFY_WAIT_INT:
-      fp_verify_wait_int (self);
+    case MAPF_IDENTIFY_WAIT_INT:
+      fp_identify_wait_int (self);
       break;
 
-    case MAPF_VERIFY_DISBALE_INT:
-      mafp_sensor_control (self, 0x89, 0, fp_verify_disable_int_cb, NULL, 0);
+    case MAPF_IDENTIFY_DISBALE_INT:
+      mafp_sensor_control (self, 0x89, 0, fp_identify_disable_int_cb, NULL, 0);
       break;
 
-    case MAPF_VERIFY_REFRESH_INT_PARA:
+    case MAPF_IDENTIFY_REFRESH_INT_PARA:
       fp_dbg ("refresh param");
       para[0] = MAFP_SLEEP_INT_REFRESH;
-      mafp_sensor_cmd (self, MOC_CMD_SLEEP, para, 1, fp_verify_int_refresh_cb);
+      mafp_sensor_cmd (self, MOC_CMD_SLEEP, para, 1, fp_identify_int_refresh_cb);
       break;
 
-    case MAPF_VERIFY_GENERATE_FEATURE:
+    case MAPF_IDENTIFY_GENERATE_FEATURE:
       para[0] = 1;  /* buffer id */
-      mafp_sensor_cmd (self, MOC_CMD_GEN_FEATURE, (const uint8_t *) &para, 1, fp_verify_gen_feature_cb);
+      mafp_sensor_cmd (self, MOC_CMD_GEN_FEATURE, (const uint8_t *) &para, 1, fp_identify_gen_feature_cb);
       break;
 
-    case MAPF_VERIFY_SEARCH_STEP:
-      if (fpi_device_get_current_action (device) == FPI_DEVICE_ACTION_VERIFY)
+    case MAPF_IDENTIFY_SEARCH_STEP:
+      fpi_device_get_identify_data (device, &prints);
+      if (!prints || prints->len == 0)
         {
-          fpi_device_get_verify_data (device, &print);
-          if (!print)
-            {
-              self->search_id = G_MAXUINT16;
-              fpi_ssm_jump_to_state (self->task_ssm, MAPF_VERIFY_GET_TEMPLATE_INFO);
-              break;
-            }
+          self->search_id = G_MAXUINT16;
+          fpi_ssm_jump_to_state (self->task_ssm, MAPF_IDENTIFY_GET_TEMPLATE_INFO);
+          break;
         }
-      else
-        {
-          fpi_device_get_identify_data (device, &prints);
-          if (!prints || prints->len == 0)
-            {
-              self->search_id = G_MAXUINT16;
-              fpi_ssm_jump_to_state (self->task_ssm, MAPF_VERIFY_GET_TEMPLATE_INFO);
-              break;
-            }
-          print = g_ptr_array_index (prints, self->enroll_identify_index);
-        }
+      print = g_ptr_array_index (prints, self->enroll_identify_index);
       mafp_template_t tpl = mafp_template_from_print (print);
       self->search_id = tpl.id;
       para[0] = (tpl.id >> 8) & 0xff;
       para[1] = tpl.id & 0xff;
-      mafp_sensor_cmd (self, MOC_CMD_MATCH_WITHFID, (const uint8_t *) &para, 2, fp_verify_search_step_cb);
+      mafp_sensor_cmd (self, MOC_CMD_MATCH_WITHFID, (const uint8_t *) &para, 2, fp_identify_search_step_cb);
       break;
 
-    case MAPF_VERIFY_GET_TEMPLATE_INFO:
+    case MAPF_IDENTIFY_GET_TEMPLATE_INFO:
       if (self->search_id == G_MAXUINT16)
         {
           mafp_cmd_response_t resp;
           resp.result = 1;
-          fp_verify_get_tpl_info_cb (self, &resp, NULL);
+          fp_identify_get_tpl_info_cb (self, &resp, NULL);
         }
       else
         {
           para[0] = (self->search_id >> 8) & 0xff;   /* fp id high */
           para[1] = self->search_id & 0xff;          /* fp id low */
-          mafp_sensor_cmd (self, MOC_CMD_GET_TEMPLATE_INFO, (const uint8_t *) &para, 2, fp_verify_get_tpl_info_cb);
+          mafp_sensor_cmd (self, MOC_CMD_GET_TEMPLATE_INFO, (const uint8_t *) &para, 2, fp_identify_get_tpl_info_cb);
         }
       break;
 
-    case MAPF_VERIFY_EXIT:
+    case MAPF_IDENTIFY_EXIT:
       mafp_pwr_btn_shield_on (self, 0);
       break;
     }
 }
 
 static void
-fp_verify_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+fp_identify_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
-  fp_dbg ("verify completed");
+  fp_dbg ("identify completed");
   FpiDeviceMafpmoc *self = FPI_DEVICE_MAFPMOC (dev);
   g_autoptr(FpPrint) new_print = g_steal_pointer (&self->identify_new_print);
   FpPrint *match_print = g_steal_pointer (&self->identify_match_print);
@@ -1899,10 +1893,7 @@ fp_verify_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   if (error && error->domain == FP_DEVICE_RETRY)
     {
-      if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY)
-        fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL, g_steal_pointer (&error));
-      else
-        fpi_device_identify_report (dev, NULL, NULL, g_steal_pointer (&error));
+      fpi_device_identify_report (dev, NULL, NULL, g_steal_pointer (&error));
 
       return;
     }
@@ -1913,20 +1904,11 @@ fp_verify_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
       return;
     }
 
-  if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY)
-    {
-      fpi_device_verify_report (dev, match_print ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL,
-                                g_steal_pointer (&new_print), NULL);
-      fpi_device_verify_complete (dev, NULL);
-    }
-  else
-    {
-      fpi_device_identify_report (dev, match_print,
-                                  self->enroll_dupl_del_state ?
-                                  g_steal_pointer (&new_print) : NULL,
-                                  NULL);
-      fpi_device_identify_complete (dev, NULL);
-    }
+  fpi_device_identify_report (dev, match_print,
+                              self->enroll_dupl_del_state ?
+                              g_steal_pointer (&new_print) : NULL,
+                              NULL);
+  fpi_device_identify_complete (dev, NULL);
 }
 
 static void
@@ -2441,7 +2423,7 @@ mafp_enroll (FpDevice *device)
 }
 
 static void
-mafp_verify_identify (FpDevice *device)
+mafp_identify (FpDevice *device)
 {
   FpiDeviceMafpmoc *self = FPI_DEVICE_MAFPMOC (device);
 
@@ -2452,14 +2434,14 @@ mafp_verify_identify (FpDevice *device)
   self->identify_match_print = NULL;
   g_clear_object (&self->identify_new_print);
 
-  self->task_ssm = fpi_ssm_new_full (device, fp_verify_sm_run_state,
-                                     MAPF_VERIFY_STATES,
-                                     MAPF_VERIFY_EXIT,
-                                     "verify");
+  self->task_ssm = fpi_ssm_new_full (device, fp_identify_sm_run_state,
+                                     MAPF_IDENTIFY_STATES,
+                                     MAPF_IDENTIFY_EXIT,
+                                     "identify");
 
   if (!PRINT_SSM_DEBUG)
     fpi_ssm_silence_debug (self->task_ssm);
-  fpi_ssm_start (self->task_ssm, fp_verify_ssm_done);
+  fpi_ssm_start (self->task_ssm, fp_identify_ssm_done);
 }
 
 static void
@@ -2496,12 +2478,6 @@ mafp_template_delete_all (FpDevice *device)
   if (!PRINT_SSM_DEBUG)
     fpi_ssm_silence_debug (self->task_ssm);
   fpi_ssm_start (self->task_ssm, fp_delete_all_ssm_done);
-}
-
-static void
-mafp_cancel (FpDevice *device)
-{
-  fp_dbg ("mafp_cancel");
 }
 
 static gboolean
@@ -2559,9 +2535,7 @@ fpi_device_mafpmoc_class_init (FpiDeviceMafpmocClass *klass)
   dev_class->close  = mafp_exit;
   dev_class->probe  = mafp_probe;
   dev_class->enroll = mafp_enroll;
-  dev_class->cancel = mafp_cancel;
-  dev_class->verify   = mafp_verify_identify;
-  dev_class->identify = mafp_verify_identify;
+  dev_class->identify = mafp_identify;
   dev_class->delete = mafp_template_delete;
   dev_class->clear_storage = mafp_template_delete_all;
   dev_class->list = mafp_template_list;
