@@ -235,8 +235,6 @@ static void check_preset_psk_read(FpDevice* dev, gboolean success,
                                   guint32 flags, guint8* psk, guint16 length,
                                   gpointer user_data, GError* error)
 {
-    g_autofree gchar* psk_str = data_to_str(psk, length);
-
     if (error) {
         fpi_ssm_mark_failed(user_data, error);
         return;
@@ -249,8 +247,8 @@ static void check_preset_psk_read(FpDevice* dev, gboolean success,
         return;
     }
 
-    fp_dbg("Device PSK: 0x%s", psk_str);
-    fp_dbg("Device PSK flags: 0x%08x", flags);
+    /* The PSK is a secret: never log its value. */
+    fp_dbg("Device PSK flags: 0x%08x, length: %u", flags, length);
 
     if (flags != GOODIX_53XD_PSK_FLAGS) {
         g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
@@ -259,16 +257,13 @@ static void check_preset_psk_read(FpDevice* dev, gboolean success,
         return;
     }
 
-    if (length != sizeof(goodix_53xd_psk_0)) {
+    if (length != sizeof(goodix_53xd_psk_0) ||
+        memcmp(psk, goodix_53xd_psk_0, sizeof(goodix_53xd_psk_0))) {
         g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
-                    "Invalid device PSK: 0x%s", psk_str);
-        fpi_ssm_mark_failed(user_data, error);
-        return;
-    }
-
-    if (memcmp(psk, goodix_53xd_psk_0, sizeof(goodix_53xd_psk_0))) {
-        g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
-                    "Invalid device PSK: 0x%s", psk_str);
+                    "The sensor's pre-shared key does not match the one this "
+                    "driver expects. It was most likely provisioned by "
+                    "another driver, such as the Windows one on a dual-boot "
+                    "system, and must be reset before it can be used here");
         fpi_ssm_mark_failed(user_data, error);
         return;
     }
